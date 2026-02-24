@@ -62,14 +62,28 @@ final class SignalCLIService: Sendable {
         
         let stdoutPipe = Pipe()
         let stdinPipe = Pipe()
+        let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderrPipe
         process.standardInput = stdinPipe
         
         self.daemonProcess = process
         self.daemonStdin = stdinPipe.fileHandleForWriting
         
         try process.run()
+        print("[SignalCLI] Daemon process started, pid=\(process.processIdentifier)")
+        
+        // Log stderr for debugging
+        let stderrHandle = stderrPipe.fileHandleForReading
+        Task.detached {
+            while true {
+                let data = stderrHandle.availableData
+                if data.isEmpty { break }
+                if let str = String(data: data, encoding: .utf8) {
+                    print("[signal-cli stderr] \(str)")
+                }
+            }
+        }
         
         // Read incoming JSON messages
         let handle = stdoutPipe.fileHandleForReading
