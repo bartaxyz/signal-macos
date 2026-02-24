@@ -72,6 +72,18 @@ final class SignalStore {
     func startDaemon() {
         guard let account = linkedAccount else { return }
         
+        // Load contacts first
+        Task {
+            let contacts = await service.loadContacts(account: account)
+            for contact in contacts {
+                guard let number = contact.number, !number.isEmpty else { continue }
+                if !conversations.contains(where: { $0.id == number }) {
+                    let c = Contact(id: number, name: contact.name)
+                    conversations.append(Conversation(id: number, contact: c, messages: []))
+                }
+            }
+        }
+        
         do {
             try service.startDaemon(account: account) { [weak self] envelope in
                 Task { @MainActor in
@@ -84,25 +96,46 @@ final class SignalStore {
     }
     
     private func handleIncomingEnvelope(_ signalEnvelope: SignalEnvelope) {
-        guard let env = signalEnvelope.envelope,
-              let source = env.source,
-              let dataMsg = env.dataMessage,
-              let body = dataMsg.message else { return }
+        guard let env = signalEnvelope.envelope else { return }
+        
+        let body: String
+        let conversationID: String
+        let isOutgoing: Bool
+        let senderName: String?
+        
+        if let dataMsg = env.dataMessage, let msg = dataMsg.message, let source = env.source {
+            // Incoming message from someone else
+            body = msg
+            conversationID = source
+            isOutgoing = false
+            senderName = env.sourceName
+        } else if let syncMsg = env.syncMessage,
+                  let sentMsg = syncMsg.sentMessage,
+                  let msg = sentMsg.message,
+                  let destination = sentMsg.destination {
+            // Sync message: sent from our own phone
+            body = msg
+            conversationID = destination
+            isOutgoing = true
+            senderName = sentMsg.destinationName
+        } else {
+            return
+        }
         
         let timestamp = env.timestamp.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) } ?? Date()
         
         let message = Message(
             timestamp: timestamp,
             body: body,
-            sender: source,
-            isOutgoing: false
+            sender: isOutgoing ? (linkedAccount ?? "") : conversationID,
+            isOutgoing: isOutgoing
         )
         
-        if let idx = conversations.firstIndex(where: { $0.id == source }) {
+        if let idx = conversations.firstIndex(where: { $0.id == conversationID }) {
             conversations[idx].messages.append(message)
         } else {
-            let contact = Contact(id: source)
-            let conversation = Conversation(id: source, contact: contact, messages: [message])
+            let contact = Contact(id: conversationID, name: senderName)
+            let conversation = Conversation(id: conversationID, contact: contact, messages: [message])
             conversations.append(conversation)
         }
     }

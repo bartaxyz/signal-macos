@@ -58,7 +58,7 @@ final class SignalCLIService: Sendable {
     func startDaemon(account: String, onMessage: @escaping @Sendable (SignalEnvelope) -> Void) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: Self.signalCLIPath)
-        process.arguments = ["-a", account, "daemon", "--json"]
+        process.arguments = ["-a", account, "--output=json", "daemon"]
         
         let stdoutPipe = Pipe()
         let stdinPipe = Pipe()
@@ -112,6 +112,37 @@ final class SignalCLIService: Sendable {
         stdinHandle.write(Data("\n".utf8))
     }
     
+    nonisolated func loadContacts(account: String) async -> [SignalContact] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Self.signalCLIPath)
+        process.arguments = ["-a", account, "--output=json", "listContacts"]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else { return [] }
+            
+            var contacts: [SignalContact] = []
+            for line in output.components(separatedBy: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                if let lineData = trimmed.data(using: .utf8),
+                   let contact = try? JSONDecoder().decode(SignalContact.self, from: lineData) {
+                    contacts.append(contact)
+                }
+            }
+            return contacts
+        } catch {
+            return []
+        }
+    }
+    
     func stopDaemon() {
         daemonProcess?.terminate()
         daemonProcess = nil
@@ -149,9 +180,11 @@ struct SignalEnvelope: Codable, Sendable {
     
     struct Envelope: Codable, Sendable {
         let source: String?
+        let sourceName: String?
         let sourceDevice: Int?
         let timestamp: Int64?
         let dataMessage: DataMessage?
+        let syncMessage: SyncMessage?
     }
     
     struct DataMessage: Codable, Sendable {
@@ -160,9 +193,27 @@ struct SignalEnvelope: Codable, Sendable {
         let groupInfo: GroupInfo?
     }
     
+    struct SyncMessage: Codable, Sendable {
+        let sentMessage: SentMessage?
+    }
+    
+    struct SentMessage: Codable, Sendable {
+        let destination: String?
+        let destinationName: String?
+        let timestamp: Int64?
+        let message: String?
+        let groupInfo: GroupInfo?
+    }
+    
     struct GroupInfo: Codable, Sendable {
         let groupId: String?
     }
+}
+
+struct SignalContact: Codable, Sendable {
+    let number: String?
+    let name: String?
+    let uuid: String?
 }
 
 struct JSONRPCRequest: Codable, Sendable {
