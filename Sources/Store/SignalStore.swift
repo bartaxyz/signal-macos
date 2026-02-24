@@ -72,26 +72,32 @@ final class SignalStore {
     func startDaemon() {
         guard let account = linkedAccount else { return }
         
-        // Load contacts first
         Task {
+            // Load contacts FIRST (before daemon locks signal-cli data)
             let contacts = await service.loadContacts(account: account)
+            print("[SignalStore] Loaded \(contacts.count) contacts")
             for contact in contacts {
                 guard let number = contact.number, !number.isEmpty else { continue }
+                // Skip own number
+                guard number != account else { continue }
                 if !conversations.contains(where: { $0.id == number }) {
-                    let c = Contact(id: number, name: contact.name)
+                    let c = Contact(id: number, name: contact.displayName)
                     conversations.append(Conversation(id: number, contact: c, messages: []))
                 }
             }
-        }
-        
-        do {
-            try service.startDaemon(account: account) { [weak self] envelope in
-                Task { @MainActor in
-                    self?.handleIncomingEnvelope(envelope)
+            print("[SignalStore] Created \(conversations.count) conversations")
+            
+            // THEN start daemon
+            do {
+                try service.startDaemon(account: account) { [weak self] envelope in
+                    Task { @MainActor in
+                        self?.handleIncomingEnvelope(envelope)
+                    }
                 }
+                print("[SignalStore] Daemon started")
+            } catch {
+                print("[SignalStore] Failed to start daemon: \(error)")
             }
-        } catch {
-            print("Failed to start daemon: \(error)")
         }
     }
     

@@ -128,6 +128,12 @@ final class SignalCLIService: Sendable {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             guard let output = String(data: data, encoding: .utf8) else { return [] }
             
+            guard let data = output.data(using: .utf8) else { return [] }
+            // Output is a JSON array
+            if let contacts = try? JSONDecoder().decode([SignalContact].self, from: data) {
+                return contacts
+            }
+            // Fallback: line-delimited JSON
             var contacts: [SignalContact] = []
             for line in output.components(separatedBy: "\n") {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -214,6 +220,23 @@ struct SignalContact: Codable, Sendable {
     let number: String?
     let name: String?
     let uuid: String?
+    let profile: SignalProfile?
+    
+    var displayName: String {
+        // Try profile name first, then top-level name, then number
+        let profileName = [profile?.givenName, profile?.familyName]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+        if !profileName.isEmpty { return profileName }
+        if let name = name, !name.isEmpty { return name }
+        return number ?? uuid ?? "Unknown"
+    }
+}
+
+struct SignalProfile: Codable, Sendable {
+    let givenName: String?
+    let familyName: String?
 }
 
 struct JSONRPCRequest: Codable, Sendable {
