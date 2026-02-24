@@ -1,5 +1,26 @@
 import Foundation
 import SwiftUI
+import os
+
+private let logger = Logger(subsystem: "com.signalmacos", category: "store")
+
+func debugLog(_ message: String) {
+    logger.info("\(message)")
+    // Also write to file for easy access
+    let logFile = "/tmp/signal-macos-debug.log"
+    let entry = "\(Date()): \(message)\n"
+    if let data = entry.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logFile) {
+            if let handle = FileHandle(forWritingAtPath: logFile) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: logFile, contents: data)
+        }
+    }
+}
 
 enum LinkingState: Sendable {
     case idle
@@ -75,34 +96,40 @@ final class SignalStore {
         Task {
             // Load contacts FIRST (before daemon locks signal-cli data)
             let contacts = await service.loadContacts(account: account)
-            print("[SignalStore] Loaded \(contacts.count) contacts")
+            debugLog("[SignalStore] Loaded \(contacts.count) contacts")
+            // Add "Note to Self" conversation
+            if !conversations.contains(where: { $0.id == account }) {
+                let selfContact = Contact(id: account, name: "Note to Self")
+                conversations.append(Conversation(id: account, contact: selfContact, messages: []))
+            }
+            
             for contact in contacts {
                 guard let number = contact.number, !number.isEmpty else { continue }
-                // Skip own number
+                // Skip own number (already added as Note to Self)
                 guard number != account else { continue }
                 if !conversations.contains(where: { $0.id == number }) {
                     let c = Contact(id: number, name: contact.displayName)
                     conversations.append(Conversation(id: number, contact: c, messages: []))
                 }
             }
-            print("[SignalStore] Created \(conversations.count) conversations")
+            debugLog("[SignalStore] Created \(conversations.count) conversations")
             
-            // THEN start daemon
-            do {
-                try service.startDaemon(account: account) { [weak self] envelope in
-                    Task { @MainActor in
-                        self?.handleIncomingEnvelope(envelope)
-                    }
+            // Start receive loop
+            service.startReceiveLoop(account: account) { [weak self] envelope in
+                Task { @MainActor in
+                    self?.handleIncomingEnvelope(envelope)
                 }
-                print("[SignalStore] Daemon started")
-            } catch {
-                print("[SignalStore] Failed to start daemon: \(error)")
             }
+            debugLog("[SignalStore] Receive loop started")
         }
     }
     
     private func handleIncomingEnvelope(_ signalEnvelope: SignalEnvelope) {
-        guard let env = signalEnvelope.envelope else { return }
+        guard let env = signalEnvelope.envelope else {
+            debugLog("[SignalStore] Envelope is nil, skipping")
+            return
+        }
+        debugLog("[SignalStore] Got envelope: source=\(env.source ?? "nil") dataMsg=\(env.dataMessage != nil) syncMsg=\(env.syncMessage != nil)")
         
         let body: String
         let conversationID: String

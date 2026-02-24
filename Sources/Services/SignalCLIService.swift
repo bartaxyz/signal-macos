@@ -53,57 +53,78 @@ final class SignalCLIService: Sendable {
         return uri
     }
     
-    // MARK: - Daemon
+    // MARK: - Receive Loop
     
-    func startDaemon(account: String, onMessage: @escaping @Sendable (SignalEnvelope) -> Void) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.signalCLIPath)
-        process.arguments = ["-a", account, "--output=json", "daemon"]
+    nonisolated(unsafe) private var isReceiving = false
+    
+    func startReceiveLoop(account: String, onMessage: @escaping @Sendable (SignalEnvelope) -> Void) {
+        guard !isReceiving else { return }
+        isReceiving = true
         
-        let stdoutPipe = Pipe()
-        let stdinPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        process.standardInput = stdinPipe
-        
-        self.daemonProcess = process
-        self.daemonStdin = stdinPipe.fileHandleForWriting
-        
-        try process.run()
-        print("[SignalCLI] Daemon process started, pid=\(process.processIdentifier)")
-        
-        // Log stderr for debugging
-        let stderrHandle = stderrPipe.fileHandleForReading
-        Task.detached {
-            while true {
-                let data = stderrHandle.availableData
-                if data.isEmpty { break }
-                if let str = String(data: data, encoding: .utf8) {
-                    print("[signal-cli stderr] \(str)")
-                }
-            }
-        }
-        
-        // Read incoming JSON messages
-        let handle = stdoutPipe.fileHandleForReading
-        Task.detached {
-            var buffer = Data()
-            while true {
-                let data = handle.availableData
-                if data.isEmpty { break } // EOF
-                buffer.append(data)
-                
-                // Process complete lines
-                while let newlineRange = buffer.range(of: Data("\n".utf8)) {
-                    let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
-                    buffer.removeSubrange(buffer.startIndex...newlineRange.lowerBound)
-                    
-                    guard !lineData.isEmpty else { continue }
-                    if let envelope = try? JSONDecoder().decode(SignalEnvelope.self, from: lineData) {
+        Task.detached { [weak self] in
+            debugLog("[SignalCLI] Starting receive loop for \(account)")
+            while self?.isReceiving == true {
+                do {
+                    let envelopes = try await self?.receiveOnce(account: account) ?? []
+                    for envelope in envelopes {
                         onMessage(envelope)
                     }
+                } catch {
+                    debugLog("[SignalCLI] Receive error: \(error)")
                 }
+                // Poll every 2 seconds
+                try? await Task.sleep(for: .seconds(2))
+            }
+            debugLog("[SignalCLI] Receive loop stopped")
+        }
+    }
+    
+    nonisolated private func receiveOnce(account: String) async throws -> [SignalEnvelope] {
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global().async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: Self.signalCLIPath)
+                process.arguments = ["-a", account, "--output=json", "receive", "-t", "1", "--send-read-receipts"]
+                
+                let stdoutPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = FileHandle.nullDevice
+                
+                do {
+                    try process.run()
+                    debugLog("[SignalCLI] receiveOnce: process started pid=\(process.processIdentifier)")
+                } catch {
+                    debugLog("[SignalCLI] receiveOnce: failed to start: \(error)")
+                    continuation.resume(throwing: error)
+                    return
+                }
+                
+                // Read data BEFORE waitUntilExit to avoid pipe deadlock
+                let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                debugLog("[SignalCLI] receiveOnce: got \(data.count) bytes, waiting for exit")
+                process.waitUntilExit()
+                debugLog("[SignalCLI] receiveOnce: exit code \(process.terminationStatus)")
+                guard let output = String(data: data, encoding: .utf8), !output.isEmpty else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                
+                var envelopes: [SignalEnvelope] = []
+                for line in output.components(separatedBy: "\n") {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty, let lineData = trimmed.data(using: .utf8) else { continue }
+                    if let envelope = try? JSONDecoder().decode(SignalEnvelope.self, from: lineData) {
+                        envelopes.append(envelope)
+                    } else {
+                        debugLog("[SignalCLI] Failed to decode: \(trimmed.prefix(200))")
+                    }
+                }
+                
+                if !envelopes.isEmpty {
+                    debugLog("[SignalCLI] Received \(envelopes.count) envelopes")
+                }
+                
+                continuation.resume(returning: envelopes)
             }
         }
     }
